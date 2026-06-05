@@ -22,7 +22,7 @@ class YoutubeDownloaderGUI:
         self.root = root
         self.root.title("YouTube Downloader")
         
-        # Розміри вікна (трохи збільшено висоту для нового елемента)
+        # Розміри вікна
         window_width = 550
         window_height = 370
         screen_width = root.winfo_screenwidth()
