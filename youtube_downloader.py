@@ -2,11 +2,15 @@
 import sys
 import threading
 import queue
+import winreg  # Модуль для роботи з реєстром Windows
 import tkinter as tk
 from tkinter import messagebox, filedialog, simpledialog
 from tkinter import ttk
 import yt_dlp
 import static_ffmpeg
+
+# Константа шляху в реєстрі
+REG_PATH = r"Software\YouTubeDownloader"
 
 def init_ffmpeg():
     """Ініціалізація або розпакування FFmpeg залежно від режиму запуску"""
@@ -16,6 +20,31 @@ def init_ffmpeg():
         os.environ["PATH"] += os.pathsep + ffmpeg_dir
     else:
         static_ffmpeg.add_paths()
+
+class UserCancelledException(Exception):
+    """Кастомне виключення для переривання yt-dlp"""
+    pass
+
+class CancelLogger:
+    """Логер для yt-dlp, який перевіряє прапорець скасування під час аналізу/логів"""
+    def __init__(self, cancel_event):
+        self.cancel_event = cancel_event
+
+    def debug(self, msg):
+        self.check_cancel()
+
+    def info(self, msg):
+        self.check_cancel()
+
+    def warning(self, msg):
+        self.check_cancel()
+
+    def error(self, msg):
+        self.check_cancel()
+
+    def check_cancel(self):
+        if self.cancel_event.is_set():
+            raise UserCancelledException("Завантаження скасовано користувачем.")
 
 class YoutubeDownloaderGUI:
     def __init__(self, root):
@@ -34,10 +63,15 @@ class YoutubeDownloaderGUI:
 
         init_ffmpeg()
 
-        # Потокобезпечна черга та події для синхронізації діалогів
+        # Потокобезпечна черга, події та прапорці
         self.gui_queue = queue.Queue()
         self.dialog_event = threading.Event()
+        self.cancel_event = threading.Event()
         self.dialog_result = None
+        self.is_downloading = False
+
+        # Зчитуємо параметри з реєстру
+        self.saved_settings = self.load_settings()
 
         # --- Блок введення посилання ---
         self.label = tk.Label(root, text="Вставте посилання на відео YouTube:", font=("Arial", 10, "bold"))
@@ -54,9 +88,11 @@ class YoutubeDownloaderGUI:
         self.dir_frame = tk.Frame(root)
         self.dir_frame.pack(pady=2)
 
-        default_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
-        if not os.path.exists(default_dir):
-            default_dir = os.getcwd()
+        default_dir = self.saved_settings.get("SavePath")
+        if not default_dir or not os.path.exists(default_dir):
+            default_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+            if not os.path.exists(default_dir):
+                default_dir = os.getcwd()
 
         self.dir_entry = tk.Entry(self.dir_frame, width=50, font=("Arial", 10))
         self.dir_entry.insert(0, default_dir)
@@ -79,11 +115,18 @@ class YoutubeDownloaderGUI:
         }
         
         self.quality_combobox = ttk.Combobox(root, values=list(self.quality_options.keys()), state="readonly", width=30, font=("Arial", 10))
-        self.quality_combobox.current(0)  # За замовчуванням: Найкраща якість
+        
+        saved_quality = self.saved_settings.get("Quality")
+        if saved_quality in self.quality_options:
+            self.quality_combobox.set(saved_quality)
+        else:
+            self.quality_combobox.current(0)
+            
         self.quality_combobox.pack(pady=2)
 
-        # --- Опція збереження вихідних файлів відео та звуку ---
-        self.keep_files_var = tk.BooleanVar(value=False)
+        # --- Опція збереження вихідних файлів ---
+        saved_keep_files = self.saved_settings.get("KeepFiles", False)
+        self.keep_files_var = tk.BooleanVar(value=saved_keep_files)
         self.keep_files_cb = tk.Checkbutton(
             root, 
             text="Зберігати окремі вихідні файли (відео та аудіо) після склейки", 
@@ -92,26 +135,89 @@ class YoutubeDownloaderGUI:
         )
         self.keep_files_cb.pack(pady=(5, 0))
 
-        # --- Блок графічного індикатора прогресу ---
+        # --- Блок індикатора прогресу ---
         self.percent_label = tk.Label(root, text="Готовність: 0%", font=("Arial", 9))
         self.percent_label.pack(pady=(5, 2))
 
         self.progress = ttk.Progressbar(root, orient="horizontal", length=450, mode="determinate")
         self.progress.pack(pady=2)
 
-        # --- Кнопка старту завантаження ---
+        # --- Кнопка дій (Скачати / Скасувати) ---
         self.download_btn = tk.Button(root, text="Скачати", font=("Arial", 10, "bold"), 
-                                      bg="#4CAF50", fg="white", padx=20, pady=5, command=self.start_download_thread)
+                                      bg="#4CAF50", fg="white", padx=20, pady=5, command=self.toggle_download)
         self.download_btn.pack(pady=10)
 
-        # Запуск моніторингу черги повідомлень (кожні 100 мс)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.check_queue()
+
+    def load_settings(self):
+        """Зчитування налаштувань із реєстру Windows"""
+        settings = {}
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0, winreg.KEY_READ)
+            
+            try:
+                settings["SavePath"], _ = winreg.QueryValueEx(key, "SavePath")
+            except FileNotFoundError:
+                pass
+
+            try:
+                settings["Quality"], _ = winreg.QueryValueEx(key, "Quality")
+            except FileNotFoundError:
+                pass
+
+            try:
+                val, _ = winreg.QueryValueEx(key, "KeepFiles")
+                settings["KeepFiles"] = bool(val)
+            except FileNotFoundError:
+                pass
+
+            winreg.CloseKey(key)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"Помилка зчитування з реєстру: {e}")
+            
+        return settings
+
+    def save_settings(self):
+        """Збереження поточних налаштувань у реєстр Windows"""
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, REG_PATH)
+            
+            winreg.SetValueEx(key, "SavePath", 0, winreg.REG_SZ, self.dir_entry.get().strip())
+            winreg.SetValueEx(key, "Quality", 0, winreg.REG_SZ, self.quality_combobox.get())
+            winreg.SetValueEx(key, "KeepFiles", 0, winreg.REG_DWORD, int(self.keep_files_var.get()))
+            
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Помилка збереження в реєстр: {e}")
+
+    def on_closing(self):
+        """Обробник закриття вікна"""
+        if self.is_downloading:
+            self.cancel_event.set()
+            self.dialog_event.set()
+        self.save_settings()
+        self.root.destroy()
 
     def browse_folder(self):
         selected_dir = filedialog.askdirectory(initialdir=self.dir_entry.get())
         if selected_dir:
             self.dir_entry.delete(0, tk.END)
             self.dir_entry.insert(0, selected_dir)
+            self.save_settings()
+
+    def toggle_download(self):
+        """Перемикач для кнопки Скачати/Скасувати"""
+        if self.is_downloading:
+            # Натиснуто кнопка Скасувати
+            self.cancel_event.set()
+            self.dialog_event.set()  # Розблоковує потік, якщо той чекає на відповідь у діалозі
+            self.percent_label.config(text="Зупинка процесу...")
+            self.download_btn.config(state=tk.DISABLED, bg="#9E9E9E")
+        else:
+            self.start_download_thread()
 
     def check_queue(self):
         """Головний потік GUI розбирає чергу завдань від фонового потоку"""
@@ -154,6 +260,10 @@ class YoutubeDownloaderGUI:
             self.root.after(100, self.check_queue)
 
     def progress_hook(self, d):
+        # Перевірка на переривання
+        if self.cancel_event.is_set():
+            raise UserCancelledException("Завантаження скасовано користувачем.")
+
         if d['status'] == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes', 0)
@@ -164,11 +274,12 @@ class YoutubeDownloaderGUI:
             self.gui_queue.put({"action": "update_ui", "percent": 100, "text": "Обробка та склейка відео..."})
 
     def start_download_thread(self):
+        self.save_settings()
+
         url = self.url_entry.get().strip()
         save_dir = self.dir_entry.get().strip()
         keep_files = self.keep_files_var.get()
         
-        # Отримуємо внутрішній формат yt-dlp відповідно до вибраного пункту
         selected_text = self.quality_combobox.get()
         format_str = self.quality_options.get(selected_text, "bestvideo+bestaudio/best")
 
@@ -179,9 +290,14 @@ class YoutubeDownloaderGUI:
             messagebox.showwarning("Увага", "Вказана папка не існує! Виберіть інший шлях.")
             return
 
+        self.cancel_event.clear()
+        self.is_downloading = True
+
         self.progress['value'] = 0
         self.percent_label.config(text="Аналіз посилання...")
-        self.download_btn.config(state=tk.DISABLED, bg="#9E9E9E")
+        
+        # Трансформуємо кнопку у стан "Скасувати"
+        self.download_btn.config(text="Скасувати", bg="#F44336", state=tk.NORMAL)
         self.browse_btn.config(state=tk.DISABLED)
         self.keep_files_cb.config(state=tk.DISABLED)
         self.quality_combobox.config(state=tk.DISABLED)
@@ -196,16 +312,17 @@ class YoutubeDownloaderGUI:
             sys.stdout = log_file
             sys.stderr = log_file
 
-            # Конфігурація для визначення правильного розширення з урахуванням вибраної якості
             meta_opts = {
                 'format': format_str,
                 'outtmpl': os.path.join(save_dir, '%(title)s.%(ext)s'),
-                'no_color': True
+                'no_color': True,
+                'logger': CancelLogger(self.cancel_event),
+                'socket_timeout': 10  # Таймаут мережевих запитів
             }
             final_filename_template = '%(title)s.%(ext)s'
 
             try:
-                # 1. Вираховуємо точне фінальне ім'я файлу через інструменти yt-dlp
+                # 1. Отримання інформації про відео
                 with yt_dlp.YoutubeDL(meta_opts) as ydl:
                     info = ydl.extract_info(video_url, download=False)
                     real_output_path = ydl.prepare_filename(info)
@@ -213,12 +330,19 @@ class YoutubeDownloaderGUI:
                 base_name = os.path.basename(real_output_path)
                 title, ext = os.path.splitext(base_name)
 
-                # 2. Перевіряємо фізичну наявність файлу на диску
+                if self.cancel_event.is_set():
+                    raise UserCancelledException("Завантаження скасовано користувачем.")
+
+                # 2. Перевірка наявності файлу
                 if os.path.exists(real_output_path):
                     self.dialog_event.clear()
                     self.gui_queue.put({"action": "ask_overwrite", "filename": real_output_path})
                     
                     self.dialog_event.wait()
+                    
+                    if self.cancel_event.is_set():
+                        raise UserCancelledException("Завантаження скасовано користувачем.")
+                        
                     user_choice = self.dialog_result
                     
                     if user_choice is True:  # Перезаписати
@@ -231,6 +355,10 @@ class YoutubeDownloaderGUI:
                         self.gui_queue.put({"action": "ask_name", "current_name": title})
                         
                         self.dialog_event.wait()
+                        
+                        if self.cancel_event.is_set():
+                            raise UserCancelledException("Завантаження скасовано користувачем.")
+                            
                         new_title = self.dialog_result
                         
                         if new_title and new_title.strip():
@@ -239,20 +367,21 @@ class YoutubeDownloaderGUI:
                                 clean_title = clean_title.replace(char, '_')
                             final_filename_template = f"{clean_title}.%(ext)s"
                         else:
-                            raise Exception("Перейменування скасовано користувачем.")
-                    else:  # Скасувати
-                        raise Exception("Завантаження скасовано користувачем.")
+                            raise UserCancelledException("Перейменування скасовано користувачем.")
+                    else:
+                        raise UserCancelledException("Завантаження скасовано користувачем.")
 
-                # 3. Налаштування для запуску фактичного скачування
+                # 3. Налаштування та завантаження
                 ydl_opts = {
                     'format': format_str,
                     'outtmpl': os.path.join(save_dir, final_filename_template),
                     'no_color': True,
                     'progress_hooks': [self.progress_hook],
+                    'logger': CancelLogger(self.cancel_event),
                     'keepvideo': keep_files,
+                    'socket_timeout': 10
                 }
 
-                # Додаткові параметри для вилучення аудіо, якщо обрано режим "Тільки аудіо"
                 if "bestaudio" in format_str and "bestvideo" not in format_str:
                     ydl_opts['postprocessors'] = [{
                         'key': 'FFmpegExtractAudio',
@@ -266,17 +395,21 @@ class YoutubeDownloaderGUI:
                     ydl.download([video_url])
                 
                 self.gui_queue.put({"action": "update_ui", "percent": 100, "text": "Завантаження успішне!"})
-                
                 self.root.after(0, lambda: messagebox.showinfo("Успіх", f"Файл успішно збережено в папку:\n{save_dir}"))
                 self.root.after(0, lambda: self.url_entry.delete(0, tk.END))
 
+            except UserCancelledException:
+                log_file.write("\nОперацію скасовано користувачем.\n")
+                self.gui_queue.put({"action": "update_ui", "percent": 0, "text": "Завантаження скасовано"})
+                
             except Exception as e:
                 log_file.write(f"\nПомилка виконання: {str(e)}\n")
-                self.gui_queue.put({"action": "update_ui", "percent": 0, "text": "Скасовано або Помилка!"})
-                if "скасовано користувачем" not in str(e):
-                    self.root.after(0, lambda: messagebox.showerror("Помилка", f"Сталася помилка. Деталі у файлі:\n{log_file_path}"))
+                self.gui_queue.put({"action": "update_ui", "percent": 0, "text": "Помилка завантаження!"})
+                self.root.after(0, lambda: messagebox.showerror("Помилка", f"Сталася помилка або невірне посилання.\nДеталі у файлі:\n{log_file_path}"))
+                
             finally:
-                self.root.after(0, lambda: self.download_btn.config(state=tk.NORMAL, bg="#4CAF50"))
+                self.is_downloading = False
+                self.root.after(0, lambda: self.download_btn.config(text="Скачати", bg="#4CAF50", state=tk.NORMAL))
                 self.root.after(0, lambda: self.browse_btn.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.keep_files_cb.config(state=tk.NORMAL))
                 self.root.after(0, lambda: self.quality_combobox.config(state="readonly"))
