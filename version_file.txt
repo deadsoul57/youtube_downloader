@@ -1,8 +1,8 @@
 ﻿# UTF-8 encoding is recommended
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(6, 1, 0, 0),        # Версія файлу (чотири числа)
-        prodvers=(6, 1, 0, 0),        # Версія продукту
+        filevers=(8, 1, 0, 0),        # Версія файлу (чотири числа)
+        prodvers=(8, 1, 0, 0),        # Версія продукту
         mask=0x3f,
         flags=0x0,
         OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
                     [
                         StringStruct('CompanyName', 'Hennadii Lerner'),
                         StringStruct('FileDescription', 'Downloader video from YouTube'),
-                        StringStruct('FileVersion', '6.1.0.0'),
+                        StringStruct('FileVersion', '8.1.0.0'),
                         StringStruct('InternalName', 'gui_downloader'),
                         StringStruct('LegalCopyright', '© 2026 Hennadii Lerner. All rights reserved.'),
                         StringStruct('OriginalFilename', 'youtube_downloader.exe'),
                         StringStruct('ProductName', 'YouTube Downloader'),
-                        StringStruct('ProductVersion', '6.1.0.0')
+                        StringStruct('ProductVersion', '8.1.0.0')
                     ]
                 )
             ]
